@@ -67,31 +67,33 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
     a, b = np.array(a), np.array(b)
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
-def add_snippet(title, code, language=None, tags=None, generate_embedding=True):
+def add_snippet(title: str, code: str, language: Optional[str] = None,
+                tags: Optional[List[str]] = None, generate_embedding: bool = True) -> int:
+    """Insert a snippet and return its new ID."""
     conn = init_db()
     tags_str = ",".join(tags) if tags else ""
     embedding = None
-    
+
     if generate_embedding:
         config = load_config()
-        # Combine title + code for embedding
         text = f"{title}\n{code}"
         embedding = get_embedding(text, config)
         if embedding:
             import pickle
             embedding = pickle.dumps(embedding)
-    
-    conn.execute(
+
+    cur = conn.execute(
         "INSERT INTO snippets (title, code, language, tags, embedding) VALUES (?, ?, ?, ?, ?)",
-        (title, code, language, tags_str, embedding)
+        (title, code, language, tags_str, embedding),
     )
     conn.commit()
-    snippet_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    snippet_id = cur.lastrowid  # reliable: lastrowid on the INSERT cursor
     print(f"Added snippet: {title} (ID: {snippet_id})")
     if embedding:
         print("  → Embedding generated for semantic search")
+    return snippet_id
 
-def list_snippets(language=None, tag=None):
+def list_snippets(language: Optional[str] = None, tag: Optional[str] = None):
     conn = init_db()
     query = "SELECT * FROM snippets WHERE 1=1"
     params = []
@@ -102,7 +104,7 @@ def list_snippets(language=None, tag=None):
         query += " AND tags LIKE ?"
         params.append(f"%{tag}%")
     query += " ORDER BY created_at DESC"
-    
+
     rows = conn.execute(query, params).fetchall()
     if not rows:
         print("No snippets found.")
@@ -110,7 +112,7 @@ def list_snippets(language=None, tag=None):
     for row in rows:
         print(f"[{row['id']}] {row['title']} | {row['language'] or '?'} | {row['tags'] or ''}")
 
-def get_snippet(snippet_id):
+def get_snippet(snippet_id: int):
     conn = init_db()
     row = conn.execute("SELECT * FROM snippets WHERE id = ?", (snippet_id,)).fetchone()
     if not row:
@@ -121,7 +123,45 @@ def get_snippet(snippet_id):
     print(f"Tags: {row['tags'] or 'N/A'}")
     print(f"\n--- Code ---\n{row['code']}")
 
-def delete_snippet(snippet_id):
+def copy_snippet(snippet_id: int):
+    """Copy a snippet's code to the system clipboard."""
+    conn = init_db()
+    row = conn.execute("SELECT title, code FROM snippets WHERE id = ?", (snippet_id,)).fetchone()
+    if not row:
+        print(f"Snippet {snippet_id} not found.")
+        return
+
+    code = row["code"]
+    copied = False
+
+    # Try pbcopy (macOS) → xclip → xsel → pyperclip in that order
+    for cmd in (["pbcopy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]):
+        try:
+            import subprocess
+            proc = subprocess.run(cmd, input=code.encode(), check=True,
+                                  capture_output=True)
+            copied = True
+            break
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+
+    if not copied:
+        try:
+            import pyperclip  # type: ignore
+            pyperclip.copy(code)
+            copied = True
+        except ImportError:
+            pass
+
+    if copied:
+        lines = code.count("\n") + 1
+        print(f"Copied '{row['title']}' ({lines} line{'s' if lines != 1 else ''}) to clipboard.")
+    else:
+        # Last resort: just print the code so the user can copy manually
+        print(f"Could not find a clipboard utility. Here is the code for '{row['title']}':\n")
+        print(code)
+
+def delete_snippet(snippet_id: int):
     conn = init_db()
     conn.execute("DELETE FROM snippets WHERE id = ?", (snippet_id,))
     conn.commit()
@@ -131,11 +171,11 @@ def search_snippets(query: str, limit: int = 5):
     """Semantic search using Ollama embeddings."""
     config = load_config()
     conn = init_db()
-    
+
     # Get query embedding
     print(f"Searching for: {query}")
     query_embedding = get_embedding(query, config)
-    
+
     if not query_embedding:
         print("Falling back to text search...")
         # Simple text fallback
@@ -146,25 +186,25 @@ def search_snippets(query: str, limit: int = 5):
         for row in rows:
             print(f"[{row['id']}] {row['title']} (text match)")
         return
-    
+
     # Search with embeddings
     import pickle
     rows = conn.execute("SELECT id, title, code, language, tags, embedding FROM snippets WHERE embedding IS NOT NULL").fetchall()
-    
+
     if not rows:
         print("No snippets with embeddings. Add snippets first, or use `code-stash list` for text search.")
         return
-    
+
     results = []
     for row in rows:
         if row['embedding']:
             emb = pickle.loads(row['embedding'])
             sim = cosine_similarity(query_embedding, emb)
             results.append((sim, row))
-    
+
     # Sort by similarity
     results.sort(key=lambda x: x[0], reverse=True)
-    
+
     print(f"\nTop {limit} results:\n")
     for score, row in results[:limit]:
         print(f"[{row['id']}] {row['title']} | similarity: {score:.3f}")
@@ -176,7 +216,7 @@ def regenerate_embeddings():
     config = load_config()
     conn = init_db()
     rows = conn.execute("SELECT id, title, code FROM snippets").fetchall()
-    
+
     import pickle
     for row in rows:
         text = f"{row['title']}\n{row['code']}"
@@ -184,19 +224,22 @@ def regenerate_embeddings():
         if emb:
             conn.execute("UPDATE snippets SET embedding = ? WHERE id = ?", (pickle.dumps(emb), row['id']))
             print(f"Indexed: {row['title']}")
-    
+
     conn.commit()
     print("Done rebuilding embeddings.")
 
-def export_snippets(filepath):
+def export_snippets(filepath: str):
     conn = init_db()
     rows = conn.execute("SELECT * FROM snippets").fetchall()
     data = [dict(row) for row in rows]
+    # Strip binary embedding blobs — they're not portable as JSON
+    for item in data:
+        item.pop("embedding", None)
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=2, default=str)
     print(f"Exported {len(data)} snippets to {filepath}")
 
-def import_snippets(filepath):
+def import_snippets(filepath: str):
     with open(filepath, 'r') as f:
         data = json.load(f)
     conn = init_db()
@@ -211,42 +254,68 @@ def import_snippets(filepath):
 def main():
     parser = argparse.ArgumentParser(prog="code-stash")
     sub = parser.add_subparsers(dest="command")
-    
+
+    # add
     add_parser = sub.add_parser("add", help="Add a snippet")
     add_parser.add_argument("title")
     add_parser.add_argument("--lang", "-l", help="Language")
     add_parser.add_argument("--tags", "-t", help="Tags (comma-separated)")
     add_parser.add_argument("--no-embed", action="store_true", help="Skip embedding generation")
-    
-    sub.add_parser("list", help="List snippets")
+
+    # list  — now supports --lang / --tag filters
+    list_parser = sub.add_parser("list", help="List snippets")
+    list_parser.add_argument("--lang", "-l", help="Filter by language")
+    list_parser.add_argument("--tag", help="Filter by tag")
+
+    # get
     sub.add_parser("get", help="Get snippet by ID").add_argument("id", type=int)
+
+    # copy  — new command
+    copy_parser = sub.add_parser("copy", help="Copy snippet code to clipboard")
+    copy_parser.add_argument("id", type=int, help="Snippet ID to copy")
+
+    # delete
     sub.add_parser("delete", help="Delete snippet").add_argument("id", type=int)
-    
+
+    # search
     search_parser = sub.add_parser("search", help="Semantic search with Ollama")
     search_parser.add_argument("query", nargs="?")
     search_parser.add_argument("--limit", "-n", type=int, default=5)
-    
+
     sub.add_parser("reindex", help="Regenerate all embeddings")
-    sub.add_parser("export", help="Export snippets").add_argument("filepath")
-    sub.add_parser("import", help="Import snippets").add_argument("filepath")
-    
+
+    # export
+    sub.add_parser("export", help="Export snippets to JSON").add_argument("filepath")
+
+    # import
+    sub.add_parser("import", help="Import snippets from JSON").add_argument("filepath")
+
     args = parser.parse_args()
-    
+
     if args.command == "add":
         tags = args.tags.split(",") if args.tags else None
-        add_snippet(args.title, "", args.lang, tags, generate_embedding=not args.no_embed)
-        # Prompt for code
-        print("Enter code (Ctrl+D to finish):")
-        code = sys.stdin.read()
-        # Update with actual code
-        conn = get_db()
-        conn.execute("UPDATE snippets SET code = ? WHERE id = (SELECT last_insert_rowid())", (code,))
-        conn.commit()
-        
+        # Read code from stdin first, then insert — avoids the stale
+        # last_insert_rowid() race condition in the original implementation.
+        print("Enter code (Ctrl+D / Ctrl+Z to finish):")
+        try:
+            code = sys.stdin.read()
+        except KeyboardInterrupt:
+            print("\nAborted.")
+            return
+        add_snippet(
+            args.title,
+            code,
+            args.lang,
+            tags,
+            generate_embedding=not args.no_embed,
+        )
+
     elif args.command == "list":
-        list_snippets()
+        list_snippets(language=getattr(args, "lang", None), tag=getattr(args, "tag", None))
     elif args.command == "get":
         get_snippet(args.id)
+    elif args.command == "copy":
+        copy_snippet(args.id)
     elif args.command == "delete":
         delete_snippet(args.id)
     elif args.command == "search":
