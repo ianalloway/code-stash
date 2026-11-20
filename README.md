@@ -8,6 +8,8 @@ A CLI code snippet manager with local Ollama-powered search.
 pip install -e .
 ```
 
+Embeddings are cached as JSON numeric arrays. To migrate an existing binary embedding cache, run `code-stash reindex` with your configured Ollama service available. The command regenerates the cache from each snippet’s saved text.
+
 ## Usage
 
 ```bash
