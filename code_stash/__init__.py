@@ -1,6 +1,5 @@
 """Code Stash - CLI code snippet manager."""
 import argparse
-import os
 import sys
 import sqlite3
 import json
@@ -23,7 +22,10 @@ def load_config() -> dict:
     import yaml
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH) as f:
-            return {**DEFAULT_CONFIG, **yaml.safe_load(f) or {}}
+            loaded = yaml.safe_load(f)
+            if loaded is not None and not isinstance(loaded, dict):
+                raise ValueError("Config must contain a YAML mapping")
+            return {**DEFAULT_CONFIG, **(loaded or {})}
     return DEFAULT_CONFIG.copy()
 
 def get_db():
@@ -79,8 +81,7 @@ def add_snippet(title: str, code: str, language: Optional[str] = None,
         text = f"{title}\n{code}"
         embedding = get_embedding(text, config)
         if embedding:
-            import pickle
-            embedding = pickle.dumps(embedding)
+            embedding = json.dumps(embedding)
 
     cur = conn.execute(
         "INSERT INTO snippets (title, code, language, tags, embedding) VALUES (?, ?, ?, ?, ?)",
@@ -188,7 +189,6 @@ def search_snippets(query: str, limit: int = 5):
         return
 
     # Search with embeddings
-    import pickle
     rows = conn.execute("SELECT id, title, code, language, tags, embedding FROM snippets WHERE embedding IS NOT NULL").fetchall()
 
     if not rows:
@@ -198,9 +198,15 @@ def search_snippets(query: str, limit: int = 5):
     results = []
     for row in rows:
         if row['embedding']:
-            emb = pickle.loads(row['embedding'])
+            if not isinstance(row['embedding'], str):
+                continue  # Old binary caches can be rebuilt from the original text.
+            emb = json.loads(row['embedding'])
             sim = cosine_similarity(query_embedding, emb)
             results.append((sim, row))
+
+    if not results:
+        print("No current embeddings. Run code-stash reindex to rebuild the search cache.")
+        return
 
     # Sort by similarity
     results.sort(key=lambda x: x[0], reverse=True)
@@ -217,12 +223,11 @@ def regenerate_embeddings():
     conn = init_db()
     rows = conn.execute("SELECT id, title, code FROM snippets").fetchall()
 
-    import pickle
     for row in rows:
         text = f"{row['title']}\n{row['code']}"
         emb = get_embedding(text, config)
         if emb:
-            conn.execute("UPDATE snippets SET embedding = ? WHERE id = ?", (pickle.dumps(emb), row['id']))
+            conn.execute("UPDATE snippets SET embedding = ? WHERE id = ?", (json.dumps(emb), row['id']))
             print(f"Indexed: {row['title']}")
 
     conn.commit()
